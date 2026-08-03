@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  goguard:
+    build: .
+    container_name: goguard
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    env_file:
+      - .env
+    volumes:
+      # Mount host log directory (read-only)
+      - /var/log/nginx:/var/log/nginx:ro
+      # Mount tmp directory for status file
+      - /tmp:/tmp
