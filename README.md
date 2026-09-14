@@ -159,7 +159,7 @@ go version
 
 | Variable                  | Default Value               | Description                                                           |
 | :------------------------ | :-------------------------- | :-------------------------------------------------------------------- |
-| `LOG_FILE_PATH`           | `/var/log/nginx/access.log` | Absolute path to the web server access log file to tail.              |
+| `LOG_FILE_PATH`           | `/var/log/nginx/access.log` | Path(s) to log file(s). Supports single files, comma-separated lists (e.g. `/var/log/nginx/a.log,/var/log/nginx/b.log`), and glob patterns (e.g. `/var/log/nginx/*-access.log`). |
 | `BLOCK_MODE`              | `both`                      | Defensive action mode: `both`, `cloudflare`, or `iptables`.           |
 | `MAX_HITS`                | `3`                         | Number of threat hits required from an IP before triggering a ban.    |
 | `TIME_WINDOW_SECONDS`     | `60`                        | Time window in seconds for tracking IP threat hits.                   |

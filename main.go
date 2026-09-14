@@ -30,6 +30,7 @@ import (
 type DaemonStatus struct {
 	PID          int               `json:"pid"`
 	StartTime    time.Time         `json:"start_time"`
+	LogFiles     []string          `json:"log_files"`
 	LogFilePath  string            `json:"log_file_path"`
 	BlockMode    string            `json:"block_mode"`
 	MaxHits      int               `json:"max_hits"`
@@ -123,7 +124,16 @@ func printStatusAndExit() {
 	fmt.Println("==================================================")
 	fmt.Printf(" Status:           %s (PID: %d)\n", statusStr, status.PID)
 	fmt.Printf(" Uptime:           %s\n", uptime)
-	fmt.Printf(" Log File Tailed:  %s\n", status.LogFilePath)
+	if len(status.LogFiles) > 1 {
+		fmt.Printf(" Log Files Tailed: (%d files)\n", len(status.LogFiles))
+		for _, f := range status.LogFiles {
+			fmt.Printf("   - %s\n", f)
+		}
+	} else if len(status.LogFiles) == 1 {
+		fmt.Printf(" Log File Tailed:  %s\n", status.LogFiles[0])
+	} else if status.LogFilePath != "" {
+		fmt.Printf(" Log File Tailed:  %s\n", status.LogFilePath)
+	}
 	fmt.Printf(" Blocking Mode:    %s\n", status.BlockMode)
 	fmt.Printf(" Max Hits Window:  %d hits / %ds\n", status.MaxHits, status.WindowSecs)
 	fmt.Printf(" Whitelisted IPs:  %s\n", strings.Join(status.Whitelist, ", "))
@@ -231,6 +241,46 @@ func isWhitelisted(ip string, whitelist []string) bool {
 	return false
 }
 
+func resolveLogFiles(rawConfig string) []string {
+	var files []string
+	seen := make(map[string]bool)
+
+	parts := strings.Split(rawConfig, ",")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+
+		matches, err := filepath.Glob(part)
+		if err != nil || len(matches) == 0 {
+			// If glob matched nothing, keep the raw path so tail will follow or wait for creation
+			if !seen[part] {
+				seen[part] = true
+				files = append(files, part)
+			}
+			continue
+		}
+
+		for _, match := range matches {
+			if fi, err := os.Stat(match); err == nil && fi.IsDir() {
+				continue
+			}
+			if !seen[match] {
+				seen[match] = true
+				files = append(files, match)
+			}
+		}
+	}
+
+	return files
+}
+
+type logEntry struct {
+	filePath string
+	line     string
+}
+
 func main() {
 	statusFlag := flag.Bool("status", false, "Display current goGuard threat detection status and exit")
 	flag.Parse()
@@ -241,7 +291,12 @@ func main() {
 
 	_ = godotenv.Load()
 
-	logFilePath := getEnv("LOG_FILE_PATH", "/var/log/nginx/access.log")
+	logFilePathRaw := getEnv("LOG_FILE_PATH", "/var/log/nginx/access.log")
+	logFiles := resolveLogFiles(logFilePathRaw)
+	if len(logFiles) == 0 {
+		log.Fatalf("No log files configured or found for path/pattern: %s", logFilePathRaw)
+	}
+
 	botKeys := getEnv("TELEGRAM_BOT_KEY", "KEYS")
 	zoneID := getEnv("CLOUDFLARE_ZONE_ID", "ZONE_ID")
 	cfApiKey := getEnv("CLOUDFLARE_API_KEY", "KEY")
@@ -285,7 +340,8 @@ func main() {
 	globalStatus = DaemonStatus{
 		PID:         os.Getpid(),
 		StartTime:   time.Now(),
-		LogFilePath: logFilePath,
+		LogFiles:    logFiles,
+		LogFilePath: logFilePathRaw,
 		BlockMode:   blockMode,
 		MaxHits:     maxHits,
 		WindowSecs:  windowSecsInt,
@@ -319,23 +375,40 @@ func main() {
 		regexp.MustCompile(`(?i)(/phpmyadmin|/wp-admin|/wp-login\.php|/xmlrpc\.php|/\.well-known/security\.txt)`),
 	}
 
-	tailConfig := tail.Config{
-		Location: &tail.SeekInfo{Offset: 0, Whence: os.SEEK_END},
-		ReOpen:   true,
-		Follow:   true,
-	}
-	tailFile, err := tail.TailFile(logFilePath, tailConfig)
-	if err != nil {
-		log.Fatalf("Failed to tail log file %s: %v", logFilePath, err)
+	linesChan := make(chan logEntry, 2048)
+
+	for _, file := range logFiles {
+		go func(targetFile string) {
+			tailConfig := tail.Config{
+				Location: &tail.SeekInfo{Offset: 0, Whence: os.SEEK_END},
+				ReOpen:   true,
+				Follow:   true,
+				Logger:   tail.DiscardingLogger,
+			}
+			tailFile, err := tail.TailFile(targetFile, tailConfig)
+			if err != nil {
+				log.Printf("Failed to tail log file %s: %v", targetFile, err)
+				return
+			}
+			log.Printf("Tailing log file: %s", targetFile)
+
+			for line := range tailFile.Lines {
+				if line.Err != nil {
+					continue
+				}
+				linesChan <- logEntry{filePath: targetFile, line: line.Text}
+			}
+		}(file)
 	}
 
-	log.Printf("Threat detection daemon started (PID: %d). Tailing %s (Block mode: %s, Max Hits: %d/%ds)", os.Getpid(), logFilePath, blockMode, maxHits, windowSecsInt)
+	log.Printf("Threat detection daemon started (PID: %d). Monitoring %d log target(s) (Block mode: %s, Max Hits: %d/%ds)",
+		os.Getpid(), len(logFiles), blockMode, maxHits, windowSecsInt)
 
 	// Process log entries and send alerts in real-time.
-	for line := range tailFile.Lines {
+	for entry := range linesChan {
 		atomic.AddUint64(&totalLinesProcessed, 1)
 
-		fields := strings.Fields(line.Text)
+		fields := strings.Fields(entry.line)
 		if len(fields) < 7 {
 			continue
 		}
@@ -355,7 +428,13 @@ func main() {
 			if pattern.MatchString(url) {
 				atomic.AddUint64(&totalThreatsDetected, 1)
 				hitCount, shouldBlock := tracker.RecordHit(clientIP)
-				message := fmt.Sprintf("Threat Detected from IP %s (Hit %d/%d) - URL: %s", clientIP, hitCount, maxHits, url)
+				
+				sourcePrefix := ""
+				if len(logFiles) > 1 {
+					sourcePrefix = fmt.Sprintf("[%s] ", filepath.Base(entry.filePath))
+				}
+
+				message := fmt.Sprintf("%sThreat Detected from IP %s (Hit %d/%d) - URL: %s", sourcePrefix, clientIP, hitCount, maxHits, url)
 				log.Println(message)
 
 				if bot != nil {
