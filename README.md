@@ -102,7 +102,7 @@ go version
 1. **Clone the repository & setup `.env`:**
 
    ```bash
-   git clone https://github.com/your-username/goGuard.git
+   https://github.com/ericpino/goguard.git
    cd goGuard
    cp .env.example .env
    ```
