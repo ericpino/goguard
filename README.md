@@ -77,7 +77,7 @@ go version
 1. **Clone the repository:**
 
    ```bash
-   git clone https://github.com/your-username/goGuard.git
+   https://github.com/ericpino/goguard.git
    cd goGuard
    ```
 
